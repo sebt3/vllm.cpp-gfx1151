@@ -91,11 +91,11 @@ portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
 GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
 `mamba_cache_dtype` default) is advertised via the
 `SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
-MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
-softmax, no bias) and `MoeSiluMul` are native; the remaining chain
-(`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
-expert GEMM) is not registered yet, so MoE-bearing models still throw on
-those ops.
+MoE-path coverage: `MoeRouterTopK` (f32/bf16 logits, ungrouped softmax, no
+bias), `MoeSiluMul`, `SharedExpertGate`, `MoeCombine`, and `MoeCombineGate`
+are native. The grouped quant expert GEMM (`kMatmulBTQuantGrouped`) is not
+registered yet, so models whose experts run keep-quant grouped GEMMs still
+throw there.
 
 ### ROCm decode GEMM routing (wvSplitK skinny path)
 
