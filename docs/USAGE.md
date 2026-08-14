@@ -5890,8 +5890,10 @@ interval does.
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`,
 `VT_GEMMA4_DECODE_INDEXED_MAX_T`). Unset indexed-max defaults to 63 (T=2..63
-uses the existing per-token indexed helpers; `=1` restores T=1-only). Defaults
-stay safe off RDNA4. GetBlas keeps two per-thread hipBLAS handles
+uses the existing per-token indexed helpers on a scratch-scaled weight copy;
+helper failure restores `compute_dev` and falls back with a single host scale).
+`=1` restores T=1-only. Defaults stay safe off RDNA4. GetBlas keeps two
+per-thread hipBLAS handles
 (`tls_slots[2]`, device 1 → slot 1) so a 0→1 hop does not destroy GPU0's handle.
 `ProductGetBlasHandle` is the test accessor for that file-local `GetBlas`. HIP
 live probe is a separate CTest target (exit 77 if `HIP_VISIBLE_DEVICES` empty);
