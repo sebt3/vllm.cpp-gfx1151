@@ -1,0 +1,101 @@
+name: rocm-gfx1151
+
+# Fork-only workflow: builds ONE image, docker/Dockerfile.rocm-gfx1151, for ONE
+# target (ROCm, gfx1151 / Strix Halo). Deliberately separate from any upstream
+# containers.yml-style multi-lane matrix: this lane is not part of
+# release/container-matrix.json and must never need to satisfy its checks.
+#
+# A hosted runner has no gfx1151 device, so this workflow proves the image
+# COMPILES and LINKS against the pinned TheRock SDK -- not that it runs
+# correctly. Real-hardware validation (ctest -R 'rocm|cross_device', an actual
+# model load) stays a manual step on the Strix Halo box; see docs/ROCM.md
+# Sec.5.2 for that recipe.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/Dockerfile.rocm-gfx1151'
+      - 'scripts/build-rocm-gfx1151-release.sh'
+      - '.github/workflows/rocm-gfx1151.yml'
+      - 'src/vt/rocm/**'
+      - 'src/vllm/platforms/rocm.cpp'
+      - 'include/vt/rocm/**'
+      - 'include/vt/device.h'
+      - 'CMakeLists.txt'
+  pull_request:
+    paths:
+      - 'docker/Dockerfile.rocm-gfx1151'
+      - 'scripts/build-rocm-gfx1151-release.sh'
+      - '.github/workflows/rocm-gfx1151.yml'
+      - 'src/vt/rocm/**'
+      - 'src/vllm/platforms/rocm.cpp'
+      - 'include/vt/rocm/**'
+      - 'include/vt/device.h'
+      - 'CMakeLists.txt'
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push the built image to ghcr.io even on a non-main ref'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-gfx1151-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/sebt3/vllm.cpp-gfx1151/rocm-gfx1151
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the gfx1151 ROCm image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file docker/Dockerfile.rocm-gfx1151 \
+            --platform linux/amd64 \
+            --tag vllm-cpp-rocm-gfx1151:verify \
+            --load \
+            .
+
+      - name: Sanity-check the built image
+        run: |
+          set -euo pipefail
+          # No gfx1151 device on this runner, so this proves the binary and
+          # its bundled runtime libs resolve -- not that inference runs.
+          docker run --rm --entrypoint /bin/sh vllm-cpp-rocm-gfx1151:verify -c '
+            set -eux
+            test -x /opt/vllm/bin/vllm-server
+            test -x /opt/vllm/bin/vllm-healthcheck
+            ldd /opt/vllm/bin/vllm-server | grep -v "not found"
+          '
+
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push' || inputs.push_image
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push :main-rocm-gfx1151
+        if: github.event_name == 'push' || inputs.push_image
+        run: |
+          set -euo pipefail
+          docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:main"
+          docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:main"
+          docker push "${IMAGE}:${GITHUB_SHA}"

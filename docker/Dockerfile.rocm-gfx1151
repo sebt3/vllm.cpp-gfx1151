@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1.7
+#
+# Fork-only image: vllm.cpp, ROCm/HIP lane, gfx1151 (Strix Halo) only.
+#
+# Deliberately a SEPARATE file from docker/Dockerfile, which is upstream's
+# shared, gated multi-lane definition (release/container-matrix.json,
+# scripts/check-container-matrix.py). This lane is not part of that matrix
+# and must never need to satisfy its checks -- it is fork-local build/package
+# infra for one machine, not a mergeable-upstream lane.
+#
+# ROCm comes from TheRock's per-run CI artifact bucket (public, unauthenticated
+# S3 read), not an apt repo or the official ROCm installer: as of this file,
+# TheRock is the only source that ships prebuilt gfx1151 math libs (rocBLAS,
+# hipBLASLt, MIOpen) -- see the logs/math-libs/gfx1151/* keys under the pinned
+# run below. Pin THEROCK_RUN_ID to a CI run you have actually verified against
+# (build_tools/fetch_artifacts.py --run-id <id> --amdgpu-targets gfx1151
+# --dry-run against https://therock-ci-artifacts.s3.amazonaws.com/ lists what
+# it would pull). The default here is the run this Dockerfile was written
+# against; TheRock artifact retention is not indefinite, so an old pin can
+# start 404ing -- that is a "get a fresher run-id" problem, not a rebuild-logic
+# problem.
+ARG UBUNTU_BASE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+ARG THEROCK_COMMIT=48d493e696d795a0aa49c8f39969345eef8f4257
+ARG THEROCK_RUN_ID=29052575219
+ARG AMDGPU_TARGET=gfx1151
+
+# ---------------------------------------------------------------------------
+# ROCm SDK stage: assemble a full TheRock dev prefix (headers + libs + hipcc)
+# for the given run-id/target. Kept as its own stage so it is cached
+# independently of source changes -- the SDK does not change when the tree
+# does.
+# ---------------------------------------------------------------------------
+
+FROM ${UBUNTU_BASE} AS rocm-sdk
+ARG DEBIAN_FRONTEND=noninteractive
+ARG THEROCK_COMMIT
+ARG THEROCK_RUN_ID
+ARG AMDGPU_TARGET
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+      ca-certificates \
+      git \
+      python3 \
+      python3-pip \
+      zstd \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --no-checkout https://github.com/ROCm/TheRock.git /therock \
+    && git -C /therock checkout "$THEROCK_COMMIT" \
+    && pip install --break-system-packages --no-cache-dir -r /therock/build_tools/requirements.txt \
+       2>/dev/null || true
+# --exclude drops the dbg/doc variants: debug symbols and generated docs are
+# dead weight for a compile-then-link-then-strip image. dev+lib+run+test stay
+# (test is small and left in for anyone who wants to run TheRock's own math
+# lib smoke tests against this exact SDK; drop it too if that's never used).
+RUN python3 /therock/build_tools/fetch_artifacts.py \
+      --run-id "$THEROCK_RUN_ID" \
+      --amdgpu-targets "$AMDGPU_TARGET" \
+      --exclude '.*_dbg_.*' '.*_doc_.*' \
+      --output-dir /opt/rocm \
+      --extract --flatten \
+    && test -x /opt/rocm/bin/hipcc || (echo "hipcc missing after fetch_artifacts -- run-id/target pin is stale or wrong" >&2; exit 1)
+
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+
+FROM ${UBUNTU_BASE} AS builder
+ARG DEBIAN_FRONTEND=noninteractive
+ARG AMDGPU_TARGET
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      file \
+      git \
+      ninja-build \
+      python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rocm-sdk /opt/rocm /opt/rocm
+ENV ROCM_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:$PATH
+WORKDIR /src
+COPY . /src
+ARG JOBS=4
+RUN --mount=type=cache,target=/src/build-rocm-gfx1151,id=vllm-cpp-rocm-gfx1151 \
+    JOBS="$JOBS" scripts/build-rocm-gfx1151-release.sh build-rocm-gfx1151 /out
+
+# The runtime libs the server actually links, resolved by the linker against
+# the real SDK rather than hand-picked by component name (mirrors the CUDA
+# lane's /cudart step in docker/Dockerfile). rocBLAS/hipBLASLt additionally
+# read arch-keyed kernel-selection data files at RUNTIME (not link time), so
+# ldd alone under-collects for them -- their library/ data directories are
+# copied explicitly below.
+RUN set -eux; mkdir -p /rocm-runtime/lib; \
+    for so in $(ldd /out/bin/vllm-server | awk '/\/opt\/rocm/{print $3}' | sort -u); do \
+      real=$(readlink -f "$so"); \
+      cp -a "$real" /rocm-runtime/lib/; \
+      base=$(basename "$so"); realbase=$(basename "$real"); \
+      [ "$base" = "$realbase" ] || ln -s "$realbase" "/rocm-runtime/lib/$base"; \
+    done; \
+    for datadir in rocblas hipblaslt; do \
+      if [ -d "/opt/rocm/lib/$datadir" ]; then \
+        mkdir -p "/rocm-runtime/lib/$datadir"; \
+        cp -a "/opt/rocm/lib/$datadir/library" "/rocm-runtime/lib/$datadir/" 2>/dev/null || true; \
+      fi; \
+    done; \
+    du -sh /rocm-runtime | sort -h
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+FROM ${UBUNTU_BASE} AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
+# libnuma1: hipMallocManaged / managed-allocation path (docs/ROCM.md Sec.3.1)
+# touches NUMA-aware host allocation on APUs. libdrm2/libdrm-amdgpu1: the
+# kernel-driver ioctl surface ROCm's user-space runtime talks through -- these
+# come from the HOST kernel/driver stack, never bundled from TheRock.
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+      ca-certificates \
+      libdrm-amdgpu1 \
+      libdrm2 \
+      libgomp1 \
+      libnuma1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && userdel --remove ubuntu \
+    && useradd --create-home --uid 1000 --user-group vllm \
+    && mkdir -p /models /cache \
+    && chown vllm:vllm /cache
+COPY --from=builder /rocm-runtime/lib/ /opt/vllm/lib/
+COPY --from=builder /out /opt/vllm
+COPY docker/healthcheck.sh /opt/vllm/bin/vllm-healthcheck
+ENV PATH=/opt/vllm/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/vllm/lib \
+    HF_HOME=/cache \
+    XDG_CACHE_HOME=/cache
+EXPOSE 8000
+VOLUME ["/models", "/cache"]
+# The ROCm device nodes (/dev/kfd, /dev/dri/renderD*) are host resources: run
+# this image with `--device=/dev/kfd --device=/dev/dri --group-add video
+# --group-add render` (no rocm-container-toolkit equivalent to nvidia's
+# exists, so these stay explicit run-time flags, not baked into the image).
+USER 1000:1000
+ENTRYPOINT ["/opt/vllm/bin/vllm-server"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD ["/opt/vllm/bin/vllm-healthcheck"]
+LABEL org.opencontainers.image.title="vllm.cpp-gfx1151" \
+      org.opencontainers.image.description="vllm.cpp OpenAI-compatible server, ROCm lane, gfx1151 (Strix Halo) only" \
+      org.opencontainers.image.source="https://github.com/sebt3/vllm.cpp-gfx1151" \
+      org.opencontainers.image.licenses="MIT" \
+      io.vllm-cpp.lane="rocm-gfx1151" \
+      io.vllm-cpp.channel="fork-preview"
