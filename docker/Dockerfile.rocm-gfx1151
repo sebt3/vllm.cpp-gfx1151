@@ -56,7 +56,7 @@ RUN python3 /therock/build_tools/fetch_artifacts.py \
       --amdgpu-targets "$AMDGPU_TARGET" \
       --exclude '.*_dbg_.*' '.*_doc_.*' \
       --output-dir /opt/rocm \
-      --extract --flatten \
+      --flatten \
     && test -x /opt/rocm/bin/hipcc || (echo "hipcc missing after fetch_artifacts -- run-id/target pin is stale or wrong" >&2; exit 1)
 
 # ---------------------------------------------------------------------------
