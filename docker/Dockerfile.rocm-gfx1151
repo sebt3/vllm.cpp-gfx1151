@@ -41,12 +41,16 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       git \
       python3 \
       python3-pip \
-      zstd \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --no-checkout https://github.com/ROCm/TheRock.git /therock \
-    && git -C /therock checkout "$THEROCK_COMMIT" \
-    && pip install --break-system-packages --no-cache-dir -r /therock/build_tools/requirements.txt \
-       2>/dev/null || true
+    && git -C /therock checkout "$THEROCK_COMMIT"
+# fetch_artifacts.py's own deps: boto3 (unsigned S3 reads via botocore.UNSIGNED,
+# artifact_backend.py) and pyzstd (archive_util.py decodes .tar.zst through
+# pyzstd, not the system zstd CLI -- a first cut here installed that CLI
+# package by mistake). TheRock carries no build_tools/requirements.txt at this
+# commit, so this is a direct install, not a silently-swallowed `-r` that can
+# 404 without failing the build the way the first version of this stage did.
+RUN pip install --break-system-packages --no-cache-dir boto3 pyzstd
 # --exclude drops the dbg/doc variants: debug symbols and generated docs are
 # dead weight for a compile-then-link-then-strip image. dev+lib+run+test stay
 # (test is small and left in for anyone who wants to run TheRock's own math
