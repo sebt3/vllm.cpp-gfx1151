@@ -80,8 +80,14 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=rocm-sdk /opt/rocm /opt/rocm
+# LD_LIBRARY_PATH matters here for more than the build: without it, the `ldd`
+# below (which harvests the libs to ship) resolves NOTHING under /opt/rocm --
+# CMake's own find_library at configure time uses ROCM_PATH directly and does
+# not need this, so the configure log staying clean hid the gap until a real
+# deploy hit `libamdhip64.so.7 => not found` at container start.
 ENV ROCM_PATH=/opt/rocm \
-    PATH=/opt/rocm/bin:$PATH
+    PATH=/opt/rocm/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rocm/lib
 WORKDIR /src
 COPY . /src
 ARG JOBS=4
@@ -107,7 +113,12 @@ RUN set -eux; mkdir -p /rocm-runtime/lib; \
         cp -a "/opt/rocm/lib/$datadir/library" "/rocm-runtime/lib/$datadir/" 2>/dev/null || true; \
       fi; \
     done; \
-    du -sh /rocm-runtime | sort -h
+    du -sh /rocm-runtime | sort -h; \
+    ldd /out/bin/vllm-server | grep -qi "not found" && \
+      { echo "some libs the server links did not resolve -- ldd output above; the harvested set below cannot be trusted" >&2; ldd /out/bin/vllm-server >&2; exit 1; }; \
+    for lib in libamdhip64.so.7 libhipblas.so.3 libhipblaslt.so.1; do \
+      test -e "/rocm-runtime/lib/$lib" || { echo "expected $lib in the harvested runtime set and it is not there" >&2; exit 1; }; \
+    done
 
 # ---------------------------------------------------------------------------
 # Runtime

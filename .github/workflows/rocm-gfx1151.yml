@@ -85,11 +85,23 @@ jobs:
           set -euo pipefail
           # No gfx1151 device on this runner, so this proves the binary and
           # its bundled runtime libs resolve -- not that inference runs.
+          # `grep -v "not found"` alone is NOT this check: it passes as soon as
+          # ANY line lacks that string, which libc.so.6/libstdc++.so.6 always
+          # guarantee regardless of whether the ROCm libs resolved. A real
+          # deploy hit `libamdhip64.so.7 => not found` while this passed green
+          # (docker/Dockerfile.rocm-gfx1151 shipped an empty lib/ dir because
+          # the builder stage had no LD_LIBRARY_PATH for ldd to resolve
+          # against). Assert the negative directly, and name the libs we
+          # actually expect to be bundled.
           docker run --rm --entrypoint /bin/sh vllm-cpp-rocm-gfx1151:verify -c '
             set -eux
             test -x /opt/vllm/bin/vllm-server
             test -x /opt/vllm/bin/vllm-healthcheck
-            ldd /opt/vllm/bin/vllm-server | grep -v "not found"
+            ldd /opt/vllm/bin/vllm-server
+            ! ldd /opt/vllm/bin/vllm-server | grep -qi "not found"
+            for lib in libamdhip64.so.7 libhipblas.so.3 libhipblaslt.so.1; do
+              test -e "/opt/vllm/lib/$lib"
+            done
           '
 
       - name: Log in to ghcr.io
