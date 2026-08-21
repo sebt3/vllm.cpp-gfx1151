@@ -23,6 +23,11 @@ on:
       - 'include/vt/rocm/**'
       - 'include/vt/device.h'
       - 'CMakeLists.txt'
+    # Fork-local version tags for this one image, e.g. v0.0.2-alpha.1.
+    # Deliberately not the upstream release.yml v* contract (that tag means
+    # "the vllm_cpp CMake VERSION", checked against CMakeLists.txt) -- this
+    # tag just names a build of this lane and carries no such promise.
+    tags: ['v*']
   pull_request:
     paths:
       - 'docker/Dockerfile.rocm-gfx1151'
@@ -39,6 +44,10 @@ on:
         description: 'Push the built image to ghcr.io even on a non-main ref'
         type: boolean
         default: false
+      version_tag:
+        description: 'Extra ghcr.io tag to push alongside :main/:<sha> (e.g. v0.0.2-alpha.1); blank = none'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -91,11 +100,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push :main-rocm-gfx1151
+      - name: Push tags
         if: github.event_name == 'push' || inputs.push_image
         run: |
           set -euo pipefail
-          docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:main"
           docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:${GITHUB_SHA}"
-          docker push "${IMAGE}:main"
           docker push "${IMAGE}:${GITHUB_SHA}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # An immutable version tag: refuse to overwrite one that already
+            # exists, same rule upstream's containers.yml uses for its own
+            # v* tags.
+            if docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+              echo "::error::${IMAGE}:${GITHUB_REF_NAME} already exists; version tags are immutable" >&2
+              exit 1
+            fi
+            docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:${GITHUB_REF_NAME}"
+            docker push "${IMAGE}:${GITHUB_REF_NAME}"
+          elif [ "${GITHUB_REF_TYPE}" = "branch" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
+            docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:main"
+            docker push "${IMAGE}:main"
+          fi
+          if [ -n "${VERSION_TAG:-}" ]; then
+            docker tag vllm-cpp-rocm-gfx1151:verify "${IMAGE}:${VERSION_TAG}"
+            docker push "${IMAGE}:${VERSION_TAG}"
+          fi
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
